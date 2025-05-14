@@ -1,115 +1,138 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace GildedRoseKata;
 
-public class GildedRose(
-    IList<Item> items, 
-    HashSet<string> ignoredItems = null, 
-    Action<Item> defaultUpdateQualityHandler = null, 
-    Dictionary<string, Action<Item>> customUpdateQualityHandlers = null
-)
+public class GildedRose(IList<Item> items)
 {
-    const int QUALITY_MIN = 0;
-    const int QUALITY_MAX = 50;
+    private const int QualityMin = 0;
+    private const int QualityMax = 50;
 
-    readonly IList<Item> Items = items;
+    private readonly IList<Item> Items = items;
 
-    readonly HashSet<string> IgnoredItems = ignoredItems ??
+    /// <summary>
+    /// Defines items by name that are immune to the ravages of time.
+    /// </summary>
+    private readonly HashSet<string> _ignoredItems =
     [
         "Sulfuras, Hand of Ragnaros"
     ];
 
-    readonly Action<Item> DefaultUpdateQualityHandler = defaultUpdateQualityHandler ?? (item =>
-    {
-        UpdateQualityBy(item, -1);
-        // degrade quality twice as fast when expired
-        if (item.SellIn < 0)
-            UpdateQualityBy(item, -1);
-    });
-
-    readonly Dictionary<string, Action<Item>> CustomUpdateQualityHandlers = customUpdateQualityHandlers ?? new()
-    {
-        // aged brie
-        // - improves with age
-        ["Aged Brie"] = item =>
+    /// <summary>
+    /// Custom update quality calculations by item name.
+    /// </summary>
+    private static readonly Dictionary<string, Func<Item, int>> CalculateQualityByItemName =
+        new()
         {
-            if (item.Quality < 50)
+            // Aged Brie
+            // - Improves with age
+            // - Cannot exceed quality max
+            ["Aged Brie"] = item =>
             {
-                UpdateQualityBy(item, 1);
-                // quality boost for really old cheese
+                // do nothing when max quality hit
+                if (item.Quality >= QualityMax) 
+                    return item.Quality;
+
+                // improve quality
+                var result = item.Quality + 1;
+
+                // +1 for old, stinky cheese
+                if (result < QualityMax && item.SellIn < 0)
+                    result++;
+
+                return result;
+            },
+
+            // Backstage Pass
+            // - Improves with age
+            // - Doubles with under 10 days left
+            // - triples with under 5 days left
+            ["Backstage passes to a TAFKAL80ETC concert"] = item =>
+            {
+                var result = item.Quality;
                 if (item.SellIn < 0)
-                    UpdateQualityBy(item, 1);
-            }
-        },
+                {
+                    // when sell in exceeded the passes are worthless
+                    result = 0;
+                }
+                else if (result < QualityMax)
+                {
+                    result++;
+                    // +1 when under 10 left to sell
+                    if (result < QualityMax && item.SellIn < 10)
+                        result++;
+                    // +1 when under 5 days left to sell
+                    if (result < QualityMax && item.SellIn < 5)
+                        result++;
+                }
+                return result;
+            },
 
-        // backstage pass
-        // - improves with age
-        // - doubles with under 10 days left
-        // - triples with under 5 days left
-        ["Backstage passes to a TAFKAL80ETC concert"] = item =>
-        {
-            if (item.SellIn < 0)
+            // Conjured Mana Cake
+            // - Degrades twice as fast
+            ["Conjured Mana Cake"] = item =>
             {
-                // sellin date passed, tickets are worthless
-                item.Quality = 0;
-            }
-            else if (item.Quality < 50)
-            {
-                UpdateQualityBy(item, 1);
-                // quality boost under 10 days out
-                if (item.SellIn < 10)
-                    UpdateQualityBy(item, 1);
-                // quality boost under 5 days out
-                if (item.SellIn < 5)
-                    UpdateQualityBy(item, 1);
-            }
-        },
+                // degrades quality based on min allowed
+                static int Degrade(int quality) => quality >= QualityMin + 2
+                                                        ? quality - 2
+                                                        : quality - 1;
 
-        // conjured item
-        // - degrades twice as fast
-        ["Conjured Mana Cake"] = item =>
-        {
-            UpdateQualityBy(item, -2);
-            if (item.SellIn < 0)
-                UpdateQualityBy(item, -2);
-        }
-    };
+                // do nothing when min quality hit
+                if (item.Quality <= QualityMin) 
+                    return item.Quality;
 
+                var result = Degrade(item.Quality);
+
+                // degrade quality twice as fast when sell in exceeded
+                if (item.SellIn < 0 && result > QualityMin)
+                    result = Degrade(result);
+
+                return result;
+            }
+        };
+
+    /// <summary>
+    /// Processes a single day of quality changes for all items.
+    /// </summary>
     public void UpdateQuality()
     {
-        // snapshot items
-        Item[] snapshot;
-        lock (Items)
-            snapshot = [.. Items];
-
-        // parallel process items
-        Parallel.ForEach(snapshot, UpdateQuality);
-    }
-
-    private void UpdateQuality(Item item)
-    {
-        if (!IgnoredItems.Contains(item.Name))
+        // process items
+        foreach (var item in Items)
         {
-            lock (item)
-            {
-                // reduce sell days remaining
-                item.SellIn--;
+            // ignore items
+            if (_ignoredItems.Contains(item.Name))
+                continue;
 
-                // lookup update quality handler for this item
-                var updateQualityHandler = CustomUpdateQualityHandlers
-                                                .GetValueOrDefault(
-                                                    item.Name, 
-                                                    DefaultUpdateQualityHandler
-                                                );
-
-                // invoke update quality handler
-                updateQualityHandler(item);
-            }
+            // another day...another quality update
+            item.SellIn--;
+            var calculateQuality = CalculateQualityByItemName.GetValueOrDefault(item.Name) 
+                                        ?? DefaultCalculateQuality;
+            item.Quality = Math.Clamp(
+                                calculateQuality(item), 
+                                QualityMin, 
+                                QualityMax
+                            );
         }
     }
 
-    private static void UpdateQualityBy(Item item, int value) =>
-        item.Quality = Math.Clamp(item.Quality + value, QUALITY_MIN, QUALITY_MAX);
+    /// <summary>
+    /// Default logic for updating a item's quality.
+    /// - Quality cannot drop below 0
+    /// - Quality degrades twice as fast when sell in has elapsed.
+    /// </summary>
+    private static int DefaultCalculateQuality(Item item)
+    {
+        if (item.Quality <= QualityMin) return item.Quality;
+
+        var result = item.Quality - 1;
+
+        // degrade quality twice as fast when sell in exceeded
+        if (result > QualityMin && item.SellIn < 0)
+            result--;
+
+        return result;
+    }
 }
